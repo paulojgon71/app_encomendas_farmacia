@@ -42,86 +42,119 @@ Esta aplicação gera sugestões de encomenda baseadas no PDF 'Mapa de Evoluçã
 
 # --- FUNÇÕES ---
 
+def clean_numbers(value):
+    """
+    Limpa formatação de números.
+    Trata casos onde linhas coladas aparecem como '3\n2' (pega no primeiro valor para segurança).
+    """
+    if not value: return 0
+    try:
+        # Se houver quebras de linha (linhas coladas), assume o primeiro valor
+        val_str = str(value).split('\n')[0]
+        
+        clean_val = val_str.strip().replace('€', '').replace(' ', '').replace(',', '.')
+        return float(clean_val) # Usa float para prevenir erros com decimais, depois converte-se
+    except ValueError:
+        return 0
+
 def extract_data_from_pdf(file):
-    """Extrai tabelas do PDF e tenta normalizar as colunas comuns em SPharm/Glintt."""
-    all_data = []
+    """
+    Extrai tabelas e procura dinamicamente as colunas certas pelo nome do cabeçalho.
+    """
+    all_rows = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             tables = page.extract_table()
             if tables:
-                for row in tables:
-                    # Filtra linhas vazias ou cabeçalhos repetidos
-                    if row and row[0] and "Código" not in str(row[0]):
-                        all_data.append(row)
+                all_rows.extend(tables)
     
-    if all_data:
-        df = pd.DataFrame(all_data)
-        
-        # TENTATIVA DE DETEÇÃO INTELIGENTE DE COLUNAS
-        # A maioria dos softwares de farmácia (SPharm) exporta: 
-        # Col 1: Descrição, Col 6: Tot. Ven., Col 7: Exist. (baseado no PDF Tecnilor)
-        # Vamos tentar ser flexíveis.
-        
-        try:
-            # Pega nas colunas essenciais. 
-            # NOTA: Se usares PDFs de outros softwares que não o SPharm, 
-            # os índices [1, 6, 7] podem ter de ser ajustados.
-            df_clean = df.iloc[:, [1, 6, 7]].copy() 
-            df_clean.columns = ['Descricao', 'Vendas', 'Stock']
-            return df_clean
-        except:
-            st.error("Erro na estrutura do PDF. O ficheiro deve ser um 'Mapa de Evolução de Vendas' padrão (SPharm).")
-            return None
-    return None
+    if not all_rows:
+        return None
 
-def clean_numbers(value):
-    """Limpa formatação de números (ex: '2\n3' -> 2)."""
-    if not value: return 0
-    try:
-        clean_val = str(value).replace('\n', '').strip().replace(',', '.')
-        # Tenta converter para float primeiro (caso haja preços misturados) e depois int
-        return int(float(clean_val))
-    except ValueError:
-        return 0
+    df = pd.DataFrame(all_rows)
+    
+    # 1. Procurar a linha de cabeçalho
+    # Vamos varrer as primeiras 10 linhas à procura de palavras-chave
+    header_idx = -1
+    col_map = {'desc': -1, 'vendas': -1, 'stock': -1}
+    
+    for i, row in df.head(10).iterrows():
+        # Converte tudo para minúsculas para facilitar a procura
+        row_str = [str(c).lower() if c else "" for c in row]
+        
+        # Verifica se esta linha parece ser o cabeçalho (tem 'descri' e 'tot' e 'ven')
+        # A verificação é flexível para apanhar "Tot. Ven.", "Tot Ven", etc.
+        has_desc = any("descri" in s for s in row_str)
+        has_vendas = any(("tot" in s and "ven" in s) for s in row_str)
+        has_exist = any("exist" in s for s in row_str)
+
+        if has_desc and has_vendas:
+            header_idx = i
+            # Agora mapeamos os índices das colunas
+            for col_i, val in enumerate(row_str):
+                if "descri" in val: col_map['desc'] = col_i
+                if "tot" in val and "ven" in val: col_map['vendas'] = col_i
+                if "exist" in val: col_map['stock'] = col_i
+            break
+    
+    # Se não encontrarmos o cabeçalho, tentamos o fallback antigo (posições fixas)
+    if header_idx == -1 or col_map['vendas'] == -1:
+        st.warning("Aviso: Cabeçalhos não detetados automaticamente. A tentar posições padrão...")
+        try:
+             df_clean = df.iloc[:, [1, 6, 7]].copy() # Tenta 1, 6, 7
+             df_clean.columns = ['Descricao', 'Vendas', 'Stock']
+             # Remove a primeira linha se tiver texto
+             return df_clean[1:]
+        except:
+            st.error("Erro crítico: Não foi possível ler as colunas do PDF.")
+            return None
+
+    # 2. Cortar o DF a partir do cabeçalho e selecionar colunas certas
+    df_clean = df.iloc[header_idx+1:].copy()
+    
+    # Seleciona apenas as colunas que identificámos
+    df_clean = df_clean.iloc[:, [col_map['desc'], col_map['vendas'], col_map['stock']]]
+    df_clean.columns = ['Descricao', 'Vendas', 'Stock']
+    
+    return df_clean
 
 def calculate_order(df, months, use_campaign, buy_qty, offer_qty):
-    """Calcula a encomenda baseada nas configurações do utilizador."""
+    """Calcula a encomenda."""
     
     # Limpeza de dados
     df['Vendas'] = df['Vendas'].apply(clean_numbers)
     df['Stock'] = df['Stock'].apply(clean_numbers)
     
+    # Filtrar produtos inválidos (Vendas 0 e Stock 0 geralmente são lixo de formatação)
+    df = df[ (df['Vendas'] > 0) | (df['Stock'] > 0) ].copy()
+
     # 1. Cálculo da Necessidade Real
-    # (Vendas Médias * Meses Desejados) - Stock Atual
     df['Necessidade_Estrita'] = (df['Vendas'] * months) - df['Stock']
     df['Necessidade_Estrita'] = df['Necessidade_Estrita'].apply(lambda x: x if x > 0 else 0)
     
     total_need = df['Necessidade_Estrita'].sum()
-    df['Encomenda_Final'] = df['Necessidade_Estrita'] # Começa igual à estrita
+    df['Encomenda_Final'] = df['Necessidade_Estrita']
     
     missing_units = 0
     total_offers = 0
     
-    # 2. Aplicação de Campanha (Se ativa)
+    # 2. Aplicação de Campanha
     if use_campaign and total_need > 0:
-        # Arredonda para o múltiplo de "buy_qty" superior
-        # Ex: Se compra 10, e preciso de 12, tenho de pedir 20.
         target_buy = math.ceil(total_need / buy_qty) * buy_qty
         
-        # Se a necessidade for 0, não força compra
+        # Garante patamar mínimo se houver necessidade
         if target_buy == 0 and total_need > 0:
-            target_buy = buy_qty # Força pelo menos um patamar se houver necessidade mínima
+            target_buy = buy_qty
             
         missing_units = target_buy - total_need
-        
-        # Calcula quantas ofertas recebe
         total_offers = int((target_buy / buy_qty) * offer_qty)
         
-        # Adiciona as unidades em falta aos produtos mais vendidos
         if missing_units > 0:
+            # Ordena por vendas para adicionar stock aos produtos que mais rodam
             df = df.sort_values(by='Vendas', ascending=False)
-            # Adiciona tudo ao primeiro (podes mudar lógica para distribuir)
-            df.iloc[0, df.columns.get_loc('Encomenda_Final')] += missing_units
+            # Adiciona ao primeiro produto da lista
+            if not df.empty:
+                df.iloc[0, df.columns.get_loc('Encomenda_Final')] += missing_units
             
         total_enc = target_buy
     else:
@@ -137,7 +170,7 @@ if uploaded_file is not None:
     with st.spinner('A processar dados...'):
         df_raw = extract_data_from_pdf(uploaded_file)
         
-    if df_raw is not None:
+    if df_raw is not None and not df_raw.empty:
         # Processamento
         df_final, total_pedir, ofertas, adicionados = calculate_order(
             df_raw, 
@@ -147,25 +180,27 @@ if uploaded_file is not None:
             rule_offer
         )
         
-        # --- DASHBOARD DE RESULTADOS ---
+        # --- DASHBOARD ---
         st.markdown("### 📊 Resumo da Encomenda")
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total a Pagar (un)", f"{total_pedir}", delta=f"+{adicionados} ajustados" if adicionados > 0 else None)
-        col2.metric("Ofertas (un)", f"{ofertas}", delta_color="normal")
-        col3.metric("Total Recebido", f"{total_pedir + ofertas}")
-        col4.metric("Cobertura Estimada", f"{meses_stock} Mês(es)")
+        col1.metric("Total a Pagar (un)", f"{int(total_pedir)}")
+        col2.metric("Ofertas (un)", f"{ofertas}")
+        col3.metric("Total Recebido", f"{int(total_pedir + ofertas)}")
+        col4.metric("Cobertura", f"{meses_stock} Mês(es)")
         
+        # Aviso se o sistema adicionou unidades
+        if adicionados > 0:
+            st.info(f"💡 Foram adicionadas **{int(adicionados)} unidades** para atingir o patamar da campanha e ganhar as ofertas.")
+
         # --- TABELA ---
         st.subheader("Detalhe dos Produtos")
         
-        # Filtra para mostrar apenas o que vai ser encomendado
         df_display = df_final[df_final['Encomenda_Final'] > 0].copy()
         
         if df_display.empty:
-            st.warning("Com base no stock atual, não é necessário encomendar nada!")
+            st.warning("Com base no stock atual, não é necessário encomendar nada! (Verifique se selecionou meses suficientes)")
         else:
-            # Formatação visual
             st.dataframe(
                 df_display[['Descricao', 'Vendas', 'Stock', 'Necessidade_Estrita', 'Encomenda_Final']], 
                 use_container_width=True,
@@ -183,3 +218,5 @@ if uploaded_file is not None:
                 file_name=f"Encomenda_{'Campanha' if ativar_campanha else 'Simples'}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+    else:
+        st.error("Não foi possível extrair dados válidos do PDF.")
